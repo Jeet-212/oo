@@ -341,7 +341,9 @@
       frame = requestAnimationFrame(() => { frame = 0; body.innerHTML = md(msg.text); });
     };
     let model = settings.model; // may be lowered for this request only, if the main model is rate limited
+    const noSystem = new Set(LS.get('mundesk.noSystem', [])); // models that reject a system prompt
     const call = (grounding) => Gemini.stream({
+      inlineSystem: noSystem.has(model),
       apiKey: settings.apiKey,
       model,
       system: def.system,
@@ -360,7 +362,12 @@
           res = await call(search);
           break;
         } catch (err) {
-          if (err.name === 'AbortError' || msg.text || attempt >= 4) throw err;
+          if (err.name === 'AbortError' || msg.text || attempt >= 6) throw err;
+          if (Gemini.isSystemError(err) && !noSystem.has(model)) {
+            noSystem.add(model);
+            LS.set('mundesk.noSystem', [...noSystem]);
+            continue;
+          }
           if (err.status === 429) {
             // Rate limited: step down. Search has its own tight quota, so drop it first,
             // then try the lightweight model, which has the highest free limits.
@@ -638,6 +645,11 @@
 
     $('#menuBtn').addEventListener('click', () => { $('#sidebar').classList.add('open'); $('#scrim').classList.add('show'); });
     $('#scrim').addEventListener('click', closeSidebar);
+
+    const clock = $('#clock');
+    const tick = () => { clock.textContent = `SYSTEM ONLINE · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`; };
+    tick();
+    setInterval(tick, 1000);
 
     renderAll();
   }

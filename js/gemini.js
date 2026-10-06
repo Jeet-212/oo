@@ -20,13 +20,19 @@ const Gemini = (() => {
    * Streams a response. Calls onText(fullTextSoFar) as chunks arrive.
    * Resolves to { text, sources: [{title, uri}], finishReason }.
    */
-  async function stream({ apiKey, model, system, messages, grounding, temperature, onText, signal }) {
+  async function stream({ apiKey, model, system, messages, grounding, temperature, onText, signal, inlineSystem }) {
     const url = `${BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
     const body = {
-      systemInstruction: { parts: [{ text: system }] },
       contents: messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] })),
       generationConfig: { temperature },
     };
+    if (inlineSystem) {
+      // Some models reject a separate system prompt, so put it at the top of the first message instead.
+      const first = body.contents[0];
+      if (first) first.parts[0].text = `${system}\n\n---\n\n${first.parts[0].text}`;
+    } else {
+      body.systemInstruction = { parts: [{ text: system }] };
+    }
     if (grounding) body.tools = [{ google_search: {} }];
 
     const res = await fetch(url, {
@@ -97,6 +103,11 @@ const Gemini = (() => {
       .sort();
   }
 
+  /** True when the model refuses a separate system prompt. */
+  function isSystemError(err) {
+    return /developer instruction|system instruction|systemInstruction/i.test((err && err.message) || '');
+  }
+
   /** True when the error means this model name can't be used (retired, renamed, not on this key). */
   function isModelError(err) {
     const m = (err && err.message) || '';
@@ -145,5 +156,5 @@ const Gemini = (() => {
     return m;
   }
 
-  return { stream, listModels, friendly, isModelError, suggestedModel, pickBest, pickLite };
+  return { stream, listModels, friendly, isModelError, isSystemError, suggestedModel, pickBest, pickLite };
 })();
