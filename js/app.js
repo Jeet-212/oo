@@ -7,8 +7,9 @@
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) { /* storage unavailable */ } },
   };
 
-  const DEFAULT_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro', 'gemini-2.0-flash'];
-  const DEFAULT_SETTINGS = { apiKey: '', model: 'gemini-2.5-flash', temperature: 0.7, grounding: true, models: [] };
+  // "-latest" aliases always point at Google's newest model of that tier.
+  const DEFAULT_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-pro-latest'];
+  const DEFAULT_SETTINGS = { apiKey: '', model: 'gemini-flash-latest', temperature: 0.7, grounding: true, models: [] };
   const HISTORY_MAX = 40;
 
   let settings = { ...DEFAULT_SETTINGS, ...LS.get('mundesk.settings', {}) };
@@ -352,13 +353,29 @@
 
     try {
       let res;
-      try {
-        res = await call(useSearch);
-      } catch (err) {
-        // Search grounding isn't available on every model/key; retry without it.
-        if (!useSearch || err.name === 'AbortError' || msg.text || /API key/i.test(err.message)) throw err;
-        msg.note = 'Live Google Search was unavailable for this request, so this answer comes from the model\'s own knowledge. Verify key facts.';
-        res = await call(false);
+      let search = useSearch;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          res = await call(search);
+          break;
+        } catch (err) {
+          if (err.name === 'AbortError' || msg.text || attempt >= 2) throw err;
+          if (Gemini.isModelError(err)) {
+            // The model was retired or renamed: switch to the best one this key can use.
+            const replacement = await findReplacementModel(err);
+            if (!replacement) throw err;
+            msg.note = `"${settings.model}" is no longer available, so MUN Desk switched to "${replacement}" automatically.`;
+            setModel(replacement);
+            continue;
+          }
+          // Search grounding isn't available on every model/key; retry without it.
+          if (search && err.status !== 429 && !/API key/i.test(err.message)) {
+            search = false;
+            msg.note = 'Live Google Search was unavailable for this request, so this answer comes from the model\'s own knowledge. Verify key facts.';
+            continue;
+          }
+          throw err;
+        }
       }
       msg.text = res.text;
       msg.sources = res.sources;
@@ -469,6 +486,24 @@
     selectMode(modeId, subId || null, true);
   }
 
+  async function findReplacementModel(err) {
+    const suggested = Gemini.suggestedModel(err);
+    try {
+      const models = await Gemini.listModels(settings.apiKey);
+      settings.models = models;
+      const pick = suggested && models.includes(suggested) ? suggested : Gemini.pickBest(models);
+      return pick && pick !== settings.model ? pick : null;
+    } catch (_) {
+      return suggested && suggested !== settings.model ? suggested : null;
+    }
+  }
+
+  function setModel(model) {
+    settings.model = model;
+    LS.set('mundesk.settings', settings);
+    renderKeyState();
+  }
+
   /* ---------- settings ---------- */
   function renderKeyState() {
     $('#keyBanner').hidden = !!settings.apiKey;
@@ -517,7 +552,12 @@
       settings.models = models;
       LS.set('mundesk.settings', settings);
       fillModelList();
-      status.textContent = `✓ Key works. ${models.length} models available: click the Model box to pick one.`;
+      const typed = $('#setModel').value.trim().replace(/^models\//, '');
+      if (!models.includes(typed)) {
+        const best = Gemini.pickBest(models);
+        if (best) $('#setModel').value = best;
+      }
+      status.textContent = `✓ Key works. Using "${$('#setModel').value}". ${models.length} models available: clear the Model box to see them all.`;
     } catch (err) {
       status.textContent = `✗ ${Gemini.friendly(err)}`;
     }

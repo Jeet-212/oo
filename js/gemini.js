@@ -95,15 +95,42 @@ const Gemini = (() => {
       .sort();
   }
 
+  /** True when the error means this model name can't be used (retired, renamed, not on this key). */
+  function isModelError(err) {
+    const m = (err && err.message) || '';
+    if (/search|grounding|tool/i.test(m) && !/update your code to use/i.test(m)) return false; // a search problem, not the model
+    return err.status === 404 || /no longer available|not found|deprecated|retired|update your code to use|model.*not supported|not supported.*model/i.test(m);
+  }
+
+  /** Google's error sometimes names a replacement, e.g. "use models/gemini-x-flash". */
+  function suggestedModel(err) {
+    const m = ((err && err.message) || '').match(/use (?:models\/)?(gemini-[\w.-]+)/i);
+    return m ? m[1].replace(/[.,]+$/, '') : null;
+  }
+
+  /** Picks the best general-purpose model from a list: newest stable Flash first. */
+  function pickBest(models) {
+    const special = /lite|preview|exp|tts|image|live|audio|embed|thinking|vision|learnlm|gemma|nano|robotics|computer/i;
+    const version = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+    const byVersion = (list) => list.slice().sort((x, y) => version(y) - version(x));
+    const flash = models.filter((n) => /flash/i.test(n));
+    return byVersion(flash.filter((n) => !special.test(n) && version(n) > 0))[0]
+      || flash.find((n) => n === 'gemini-flash-latest')
+      || byVersion(flash.filter((n) => !/tts|image|live|audio|embed/i.test(n)))[0]
+      || byVersion(models.filter((n) => !special.test(n)))[0]
+      || models[0]
+      || null;
+  }
+
   /** Turns raw API errors into advice a student can act on. */
   function friendly(err) {
     const m = (err && err.message) || String(err);
     if (/API key not valid|API_KEY_INVALID/i.test(m)) return 'Your Gemini API key looks invalid. Open Settings and paste the key again.';
-    if (err.status === 429 || /quota|rate/i.test(m)) return 'You hit the free-tier rate limit. Wait a minute and retry, or switch to a lighter model such as gemini-2.5-flash-lite in Settings.';
-    if (err.status === 404 || /not found|is not supported/i.test(m)) return `That model isn't available on your key. Open Settings and click "Load my models" to pick one. (${m})`;
+    if (err.status === 429 || /quota|rate/i.test(m)) return 'You hit the free-tier rate limit. Wait a minute and retry, or switch to a lighter model such as gemini-flash-lite-latest in Settings.';
+    if (isModelError(err)) return `That model isn't available on your key. Open Settings, click "Load my models", and pick one from the Model box. (${m})`;
     if (/Failed to fetch|NetworkError/i.test(m)) return 'Network error: check your internet connection.';
     return m;
   }
 
-  return { stream, listModels, friendly };
+  return { stream, listModels, friendly, isModelError, suggestedModel, pickBest };
 })();

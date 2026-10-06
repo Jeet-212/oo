@@ -30,7 +30,7 @@ Repo → **Settings → Pages** → Source: *Deploy from a branch* → pick your
 
 ## Tips
 
-- **Model:** `gemini-2.5-flash` is the default (fast, generous free tier). If you hit rate limits, try `gemini-2.5-flash-lite`. For deeper research, try a Pro model (lower free limits). **Load my models** lists every model your key can use, including newer ones.
+- **Model:** `gemini-flash-latest` is the default (always Google's newest Flash model). If Google retires a model, MUN Desk switches to the best available one automatically. If you hit rate limits, try `gemini-flash-lite-latest`. For deeper research, try a Pro model (lower free limits). **Load my models** lists every model your key can use, including newer ones.
 - **Live search** (Research & Quick) adds cited sources. If it isn't available for your key or model, the app retries without it automatically and shows a notice.
 - Always double-check resolution numbers and statistics before quoting them in committee. The AI marks anything it is unsure about with "(verify)".
 
