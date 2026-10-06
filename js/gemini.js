@@ -11,6 +11,8 @@ const Gemini = (() => {
     } catch (_) { /* not JSON */ }
     const err = new Error(msg);
     err.status = res.status;
+    const wait = msg.match(/retry in ([\d.]+)\s*s/i) || msg.match(/"retryDelay":\s*"(\d+)s"/);
+    if (wait) err.retryAfter = Math.ceil(parseFloat(wait[1]));
     return err;
   }
 
@@ -122,15 +124,26 @@ const Gemini = (() => {
       || null;
   }
 
+  /** The lightest, highest-quota model on the key (used when the main one is rate limited). */
+  function pickLite(models) {
+    const ok = (n) => /flash/i.test(n) && !/tts|image|live|audio|embed|preview|exp/i.test(n);
+    const version = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+    const lite = models.filter((n) => ok(n) && /lite/i.test(n)).sort((x, y) => version(y) - version(x));
+    return lite[0] || null;
+  }
+
   /** Turns raw API errors into advice a student can act on. */
   function friendly(err) {
     const m = (err && err.message) || String(err);
     if (/API key not valid|API_KEY_INVALID/i.test(m)) return 'Your Gemini API key looks invalid. Open Settings and paste the key again.';
-    if (err.status === 429 || /quota|rate/i.test(m)) return 'You hit the free-tier rate limit. Wait a minute and retry, or switch to a lighter model such as gemini-flash-lite-latest in Settings.';
+    if (err.status === 429 || /quota|rate/i.test(m)) {
+      const wait = err.retryAfter ? `about ${err.retryAfter} seconds` : 'a minute';
+      return `You hit Google's free-tier limit (it resets every minute, with a separate daily cap). Wait ${wait} and press Regenerate. Tips: choose "Standard" or "Quick brief" depth, and avoid sending several requests back to back.`;
+    }
     if (isModelError(err)) return `That model isn't available on your key. Open Settings, click "Load my models", and pick one from the Model box. (${m})`;
     if (/Failed to fetch|NetworkError/i.test(m)) return 'Network error: check your internet connection.';
     return m;
   }
 
-  return { stream, listModels, friendly, isModelError, suggestedModel, pickBest };
+  return { stream, listModels, friendly, isModelError, suggestedModel, pickBest, pickLite };
 })();

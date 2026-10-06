@@ -340,9 +340,10 @@
       if (frame) return;
       frame = requestAnimationFrame(() => { frame = 0; body.innerHTML = md(msg.text); });
     };
+    let model = settings.model; // may be lowered for this request only, if the main model is rate limited
     const call = (grounding) => Gemini.stream({
       apiKey: settings.apiKey,
-      model: settings.model,
+      model,
       system: def.system,
       messages: contents,
       grounding,
@@ -359,12 +360,29 @@
           res = await call(search);
           break;
         } catch (err) {
-          if (err.name === 'AbortError' || msg.text || attempt >= 2) throw err;
+          if (err.name === 'AbortError' || msg.text || attempt >= 4) throw err;
+          if (err.status === 429) {
+            // Rate limited: step down. Search has its own tight quota, so drop it first,
+            // then try the lightweight model, which has the highest free limits.
+            if (search) {
+              search = false;
+              msg.note = 'Google\'s free search quota is used up right now, so this answer comes from the model\'s own knowledge. Verify key facts.';
+              continue;
+            }
+            const lite = await findLiteModel(model);
+            if (lite) {
+              model = lite;
+              msg.note = `"${settings.model}" is rate limited, so this answer was written with the lighter "${lite}".`;
+              continue;
+            }
+            throw err;
+          }
           if (Gemini.isModelError(err)) {
             // The model was retired or renamed: switch to the best one this key can use.
             const replacement = await findReplacementModel(err);
             if (!replacement) throw err;
-            msg.note = `"${settings.model}" is no longer available, so MUN Desk switched to "${replacement}" automatically.`;
+            msg.note = `"${model}" is no longer available, so MUN Desk switched to "${replacement}" automatically.`;
+            model = replacement;
             setModel(replacement);
             continue;
           }
@@ -496,6 +514,15 @@
     } catch (_) {
       return suggested && suggested !== settings.model ? suggested : null;
     }
+  }
+
+  async function findLiteModel(current) {
+    let models = settings.models || [];
+    if (!models.length) {
+      try { models = settings.models = await Gemini.listModels(settings.apiKey); } catch (_) { /* keep empty */ }
+    }
+    const lite = Gemini.pickLite(models) || (models.length ? null : 'gemini-flash-lite-latest');
+    return lite && lite !== current ? lite : null;
   }
 
   function setModel(model) {
