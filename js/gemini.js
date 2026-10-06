@@ -110,6 +110,13 @@ const Gemini = (() => {
       }
     }
 
+    if (!text.trim() && finishReason !== 'MAX_TOKENS') {
+      // Gemini occasionally "finishes" without writing anything; callers should retry.
+      const e = new Error(`${model} returned an empty response${finishReason ? ` (${finishReason})` : ''}.`);
+      e.status = 502;
+      e.empty = true;
+      throw e;
+    }
     return {
       text,
       finishReason,

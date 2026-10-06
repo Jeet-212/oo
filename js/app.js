@@ -348,6 +348,7 @@
     };
     const noSystem = new Set(LS.get('mundesk.noSystem', [])); // models that reject a system prompt
     const dead = new Set(LS.get('mundesk.dead', [])); // models Google has retired for this key
+    const emptyRetried = new Set();
     let model = '';
     let search = useSearch && Date.now() > LS.get('mundesk.searchBlockedUntil', 0);
     if (useSearch && !search) msg.note = 'Live Google Search isn\'t available on your key right now, so this answer comes from the model\'s own knowledge. Verify key facts.';
@@ -387,6 +388,12 @@
                 search = false;
                 LS.set('mundesk.searchBlockedUntil', Date.now() + SEARCH_COOLDOWN);
                 msg.note = 'Live Google Search isn\'t available on your key right now, so this answer comes from the model\'s own knowledge. Verify key facts.';
+                continue;
+              }
+              if (err.empty) {
+                // Empty answer: ask the same model once more, then move on.
+                if (emptyRetried.has(m)) break;
+                emptyRetried.add(m);
                 continue;
               }
               if (Gemini.isSystemError(err) && !noSystem.has(m)) {
