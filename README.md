@@ -30,8 +30,9 @@ Repo → **Settings → Pages** → Source: *Deploy from a branch* → pick your
 
 ## Tips
 
-- **Model:** `gemini-flash-latest` is the default (always Google's newest Flash model). If Google retires a model, MUN Desk switches to the best available one automatically. If you hit rate limits, try `gemini-flash-lite-latest`. For deeper research, try a Pro model (lower free limits). **Load my models** lists every model your key can use, including newer ones.
-- **Live search** (Research & Quick) adds cited sources. If it isn't available for your key or model, the app retries without it automatically and shows a notice.
+- **Model: leave it on `auto`.** Google's free models are often "busy" (error 503). On `auto`, MUN Desk tries the best free models in order (newest Flash first, then Lite), remembers which one worked last, skips busy ones for a few minutes, and waits and retries if all of them are busy. The badge in the top-right shows which model answered.
+- **Live search** (Research & Quick) needs Google Search quota, which many free keys don't have. If Google refuses it, MUN Desk stops asking for an hour and answers from the model's own knowledge, with a notice.
+- Answers usually take 20–90 seconds on the free tier, depending on how busy Google is.
 - Always double-check resolution numbers and statistics before quoting them in committee. The AI marks anything it is unsure about with "(verify)".
 
 ## Files

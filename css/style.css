@@ -392,3 +392,4 @@ body.busy .status i { background: var(--warn-ink); box-shadow: 0 0 10px var(--wa
   .msg.model::before { left: 12px; }
 }
 @media (prefers-reduced-motion: reduce) { body::after, .reactor, .reactor::before, .status i { animation: none; } }
+.status-line { font-family: var(--mono); font-size: 12.5px; letter-spacing: .08em; color: var(--muted); margin-top: 6px; }

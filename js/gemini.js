@@ -20,7 +20,31 @@ const Gemini = (() => {
    * Streams a response. Calls onText(fullTextSoFar) as chunks arrive.
    * Resolves to { text, sources: [{title, uri}], finishReason }.
    */
-  async function stream({ apiKey, model, system, messages, grounding, temperature, onText, signal, inlineSystem }) {
+  async function stream({ apiKey, model, system, messages, grounding, temperature, onText, signal, inlineSystem, timeoutMs = 45000 }) {
+    // Our own controller, so a stalled connection can be cut off without the caller's Stop button.
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    if (signal) { if (signal.aborted) ctrl.abort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+    let timedOut = false;
+    let timer = 0;
+    const arm = () => { clearTimeout(timer); timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs); };
+    arm();
+    try {
+      return await streamInner({ apiKey, model, system, messages, grounding, temperature, onText, inlineSystem, signal: ctrl.signal, arm });
+    } catch (err) {
+      if (timedOut) {
+        const e = new Error(`${model} stopped responding.`);
+        e.status = 504;
+        throw e;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  async function streamInner({ apiKey, model, system, messages, grounding, temperature, onText, inlineSystem, signal, arm }) {
     const url = `${BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
     const body = {
       contents: messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] })),
@@ -71,6 +95,7 @@ const Gemini = (() => {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      arm();
       buf += decoder.decode(value, { stream: true });
       let nl;
       while ((nl = buf.indexOf('\n')) >= 0) {
@@ -115,38 +140,38 @@ const Gemini = (() => {
     return err.status === 404 || /no longer available|not found|deprecated|retired|update your code to use|model.*not supported|not supported.*model/i.test(m);
   }
 
-  /** Google's error sometimes names a replacement, e.g. "use models/gemini-x-flash". */
-  function suggestedModel(err) {
-    const m = ((err && err.message) || '').match(/use (?:models\/)?(gemini-[\w.-]+)/i);
-    return m ? m[1].replace(/[.,]+$/, '') : null;
-  }
-
-  /** Picks the best general-purpose model from a list: newest stable Flash first. */
-  function pickBest(models) {
-    const special = /lite|preview|exp|tts|image|live|audio|embed|thinking|vision|learnlm|gemma|nano|robotics|computer/i;
+  /**
+   * Orders a key's models for MUN writing: newest Flash first, then Lite models as backups.
+   * Skips specialised models (speech, images, previews) and Pro (no free quota on most keys).
+   */
+  function rankModels(models) {
+    const skip = /tts|image|live|audio|embed|preview|exp|robotics|computer|transcribe|omni|gemma|nano|banana|lyria|antigravity|research|customtools|pro/i;
     const version = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
     const byVersion = (list) => list.slice().sort((x, y) => version(y) - version(x));
-    const flash = models.filter((n) => /flash/i.test(n));
-    return byVersion(flash.filter((n) => !special.test(n) && version(n) > 0))[0]
-      || flash.find((n) => n === 'gemini-flash-latest')
-      || byVersion(flash.filter((n) => !/tts|image|live|audio|embed/i.test(n)))[0]
-      || byVersion(models.filter((n) => !special.test(n)))[0]
-      || models[0]
-      || null;
+    const ok = models.filter((n) => /^gemini-/.test(n) && /flash/.test(n) && !skip.test(n));
+    return [...byVersion(ok.filter((n) => !/lite/.test(n))), ...byVersion(ok.filter((n) => /lite/.test(n)))];
   }
 
-  /** The lightest, highest-quota model on the key (used when the main one is rate limited). */
-  function pickLite(models) {
-    const ok = (n) => /flash/i.test(n) && !/tts|image|live|audio|embed|preview|exp/i.test(n);
-    const version = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
-    const lite = models.filter((n) => ok(n) && /lite/i.test(n)).sort((x, y) => version(y) - version(x));
-    return lite[0] || null;
+  /** Temporary server-side trouble: worth trying another model or waiting. */
+  function isBusy(err) {
+    if (!err) return false;
+    // A dropped connection (TypeError from fetch) is usually Google or the network hiccuping.
+    if (err.name === 'TypeError') return true;
+    return [429, 500, 502, 503, 504].includes(err.status) || /overloaded|high demand|unavailable|stopped responding|failed to fetch|network/i.test(err.message || '');
+  }
+
+  /** The request failed because of Google Search (quota or not supported), not the model. */
+  function isSearchError(err) {
+    return err && (err.status === 429 || /search|grounding|tool/i.test(err.message || ''));
   }
 
   /** Turns raw API errors into advice a student can act on. */
   function friendly(err) {
     const m = (err && err.message) || String(err);
     if (/API key not valid|API_KEY_INVALID/i.test(m)) return 'Your Gemini API key looks invalid. Open Settings and paste the key again.';
+    if ([500, 502, 503, 504].includes(err.status) || /high demand|overloaded/i.test(m)) {
+      return 'Google\'s Gemini servers are overloaded right now: every model was busy, even after several retries. This is on Google\'s side. Wait a minute and press Regenerate.';
+    }
     if (err.status === 429 || /quota|rate/i.test(m)) {
       const wait = err.retryAfter ? `about ${err.retryAfter} seconds` : 'a minute';
       return `You hit Google's free-tier limit (it resets every minute, with a separate daily cap). Wait ${wait} and press Regenerate. Tips: choose "Standard" or "Quick brief" depth, and avoid sending several requests back to back.`;
@@ -156,5 +181,5 @@ const Gemini = (() => {
     return m;
   }
 
-  return { stream, listModels, friendly, isModelError, isSystemError, suggestedModel, pickBest, pickLite };
+  return { stream, listModels, friendly, isModelError, isSystemError, isBusy, isSearchError, rankModels };
 })();

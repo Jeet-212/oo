@@ -7,12 +7,14 @@
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) { /* storage unavailable */ } },
   };
 
-  // "-latest" aliases always point at Google's newest model of that tier.
-  const DEFAULT_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-pro-latest'];
-  const DEFAULT_SETTINGS = { apiKey: '', model: 'gemini-flash-latest', temperature: 0.7, grounding: true, models: [] };
+  // "auto" tries the best available models in order, so one busy or retired model never blocks you.
+  const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+  const DEFAULT_SETTINGS = { apiKey: '', model: 'auto', temperature: 0.7, grounding: true, models: [], modelsAt: 0, lastModel: '' };
+  const SEARCH_COOLDOWN = 60 * 60 * 1000;
   const HISTORY_MAX = 40;
 
   let settings = { ...DEFAULT_SETTINGS, ...LS.get('mundesk.settings', {}) };
+  if (['', 'gemini-flash-latest', 'gemini-2.5-flash'].includes(settings.model)) settings.model = 'auto'; // old defaults
   let shared = LS.get('mundesk.shared', {}); // country/committee/agenda shared across modes
   let drafts = LS.get('mundesk.drafts', {}); // other field values, per mode
   let history = LS.get('mundesk.history', []);
@@ -340,67 +342,75 @@
       if (frame) return;
       frame = requestAnimationFrame(() => { frame = 0; body.innerHTML = md(msg.text); });
     };
-    let model = settings.model; // may be lowered for this request only, if the main model is rate limited
+    const setStatus = (text) => {
+      if (msg.text) return;
+      body.innerHTML = `<div class="typing"><span></span><span></span><span></span></div><div class="status-line">${esc(text)}</div>`;
+    };
     const noSystem = new Set(LS.get('mundesk.noSystem', [])); // models that reject a system prompt
-    const call = (grounding) => Gemini.stream({
+    const dead = new Set(LS.get('mundesk.dead', [])); // models Google has retired for this key
+    let model = '';
+    let search = useSearch && Date.now() > LS.get('mundesk.searchBlockedUntil', 0);
+    if (useSearch && !search) msg.note = 'Live Google Search isn\'t available on your key right now, so this answer comes from the model\'s own knowledge. Verify key facts.';
+    const call = () => Gemini.stream({
       inlineSystem: noSystem.has(model),
       apiKey: settings.apiKey,
       model,
       system: def.system,
       messages: contents,
-      grounding,
+      grounding: search,
       temperature: settings.temperature,
       onText,
       signal: controller.signal,
     });
 
     try {
-      let res;
-      let search = useSearch;
-      for (let attempt = 0; ; attempt++) {
-        try {
-          res = await call(search);
-          break;
-        } catch (err) {
-          if (err.name === 'AbortError' || msg.text || attempt >= 6) throw err;
-          if (Gemini.isSystemError(err) && !noSystem.has(model)) {
-            noSystem.add(model);
-            LS.set('mundesk.noSystem', [...noSystem]);
-            continue;
-          }
-          if (err.status === 429) {
-            // Rate limited: step down. Search has its own tight quota, so drop it first,
-            // then try the lightweight model, which has the highest free limits.
-            if (search) {
-              search = false;
-              msg.note = 'Google\'s free search quota is used up right now, so this answer comes from the model\'s own knowledge. Verify key facts.';
-              continue;
-            }
-            const lite = await findLiteModel(model);
-            if (lite) {
-              model = lite;
-              msg.note = `"${settings.model}" is rate limited, so this answer was written with the lighter "${lite}".`;
-              continue;
-            }
-            throw err;
-          }
-          if (Gemini.isModelError(err)) {
-            // The model was retired or renamed: switch to the best one this key can use.
-            const replacement = await findReplacementModel(err);
-            if (!replacement) throw err;
-            msg.note = `"${model}" is no longer available, so MUN Desk switched to "${replacement}" automatically.`;
-            model = replacement;
-            setModel(replacement);
-            continue;
-          }
-          // Search grounding isn't available on every model/key; retry without it.
-          if (search && err.status !== 429 && !/API key/i.test(err.message)) {
-            search = false;
-            msg.note = 'Live Google Search was unavailable for this request, so this answer comes from the model\'s own knowledge. Verify key facts.';
-            continue;
-          }
-          throw err;
+      let res = null;
+      let lastErr = null;
+      const chain = await modelChain();
+      rounds: for (let round = 0; round < 3; round++) {
+        if (round > 0) {
+          for (let s = round * 4; s > 0; s--) { setStatus(`Google's servers are busy. Retrying in ${s}s…`); await sleep(1000, controller.signal); }
         }
+        for (const m of chain) {
+          if (dead.has(m)) continue;
+          model = m;
+          for (let fix = 0; fix < 3; fix++) {
+            setStatus(`Connecting to ${m}${search ? ' + Google Search' : ''}…`);
+            try {
+              res = await call();
+              break rounds;
+            } catch (err) {
+              if (err.name === 'AbortError' || msg.text) throw err; // stopped, or keep the partial answer
+              lastErr = err;
+              if (search && Gemini.isSearchError(err)) {
+                // Search has its own small quota (zero on many free keys): stop asking for an hour.
+                search = false;
+                LS.set('mundesk.searchBlockedUntil', Date.now() + SEARCH_COOLDOWN);
+                msg.note = 'Live Google Search isn\'t available on your key right now, so this answer comes from the model\'s own knowledge. Verify key facts.';
+                continue;
+              }
+              if (Gemini.isSystemError(err) && !noSystem.has(m)) {
+                noSystem.add(m);
+                LS.set('mundesk.noSystem', [...noSystem]);
+                continue;
+              }
+              if (Gemini.isModelError(err)) {
+                dead.add(m);
+                LS.set('mundesk.dead', [...dead]);
+                break; // next model
+              }
+              if (Gemini.isBusy(err)) { markBusy(m); break; } // next model
+              throw err; // bad key etc.: retrying won't help
+            }
+          }
+        }
+      }
+      if (!res) throw lastErr || new Error('No Gemini model is available on this key. Open Settings and click "Load my models".');
+      settings.lastModel = model;
+      LS.set('mundesk.settings', settings);
+      renderKeyState();
+      if (settings.model !== 'auto' && model !== settings.model) {
+        msg.note = [msg.note, `"${settings.model}" was unavailable, so this answer was written by "${model}".`].filter(Boolean).join(' ');
       }
       msg.text = res.text;
       msg.sources = res.sources;
@@ -511,43 +521,50 @@
     selectMode(modeId, subId || null, true);
   }
 
-  async function findReplacementModel(err) {
-    const suggested = Gemini.suggestedModel(err);
-    try {
-      const models = await Gemini.listModels(settings.apiKey);
-      settings.models = models;
-      const pick = suggested && models.includes(suggested) ? suggested : Gemini.pickBest(models);
-      return pick && pick !== settings.model ? pick : null;
-    } catch (_) {
-      return suggested && suggested !== settings.model ? suggested : null;
+  /** Models to try, best first: the user's pick (if not auto), then the key's models ranked. */
+  async function modelChain() {
+    const stale = Date.now() - (settings.modelsAt || 0) > 24 * 60 * 60 * 1000;
+    if (!settings.models || !settings.models.length || stale) {
+      try {
+        settings.models = await Gemini.listModels(settings.apiKey);
+        settings.modelsAt = Date.now();
+        LS.set('mundesk.settings', settings);
+      } catch (_) { /* fall back to the aliases below */ }
     }
+    const ranked = settings.models && settings.models.length ? Gemini.rankModels(settings.models) : [];
+    const preferred = settings.model && settings.model !== 'auto' ? [settings.model] : [];
+    const lastGood = settings.lastModel ? [settings.lastModel] : [];
+    const busyUntil = LS.get('mundesk.busy', {});
+    const all = [...new Set([...preferred, ...lastGood, ...ranked, ...FALLBACK_MODELS])];
+    // Models that were busy in the last few minutes go to the back of the queue.
+    const isBusy = (m) => (busyUntil[m] || 0) > Date.now();
+    return [...all.filter((m) => !isBusy(m)), ...all.filter(isBusy)].slice(0, 8);
   }
 
-  async function findLiteModel(current) {
-    let models = settings.models || [];
-    if (!models.length) {
-      try { models = settings.models = await Gemini.listModels(settings.apiKey); } catch (_) { /* keep empty */ }
-    }
-    const lite = Gemini.pickLite(models) || (models.length ? null : 'gemini-flash-lite-latest');
-    return lite && lite !== current ? lite : null;
+  function markBusy(model) {
+    const busyUntil = LS.get('mundesk.busy', {});
+    for (const [m, t] of Object.entries(busyUntil)) if (t < Date.now()) delete busyUntil[m];
+    busyUntil[model] = Date.now() + 3 * 60 * 1000;
+    LS.set('mundesk.busy', busyUntil);
   }
 
-  function setModel(model) {
-    settings.model = model;
-    LS.set('mundesk.settings', settings);
-    renderKeyState();
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(resolve, ms);
+      if (signal) signal.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+    });
   }
 
   /* ---------- settings ---------- */
   function renderKeyState() {
     $('#keyBanner').hidden = !!settings.apiKey;
-    $('#modelPill').textContent = settings.model;
+    $('#modelPill').textContent = settings.model === 'auto' ? `auto${settings.lastModel ? ` · ${settings.lastModel}` : ''}` : settings.model;
   }
 
   function fillModelList() {
     const dl = $('#modelList');
     dl.innerHTML = '';
-    const all = [...new Set([...DEFAULT_MODELS, ...(settings.models || [])])];
+    const all = [...new Set(['auto', ...Gemini.rankModels(settings.models || []), ...FALLBACK_MODELS])];
     for (const m of all) dl.append(el('option', { value: m }));
   }
 
@@ -568,7 +585,9 @@
 
   function saveSettings() {
     settings.apiKey = $('#setKey').value.trim();
-    settings.model = $('#setModel').value.trim().replace(/^models\//, '') || DEFAULT_SETTINGS.model;
+    const typed = $('#setModel').value.trim().replace(/^models\//, '');
+    if (typed !== settings.model) settings.lastModel = '';
+    settings.model = typed || 'auto';
     settings.temperature = parseFloat($('#setTemp').value);
     settings.grounding = $('#setGrounding').checked;
     LS.set('mundesk.settings', settings);
@@ -584,14 +603,13 @@
     try {
       const models = await Gemini.listModels(key);
       settings.models = models;
+      settings.modelsAt = Date.now();
       LS.set('mundesk.settings', settings);
       fillModelList();
       const typed = $('#setModel').value.trim().replace(/^models\//, '');
-      if (!models.includes(typed)) {
-        const best = Gemini.pickBest(models);
-        if (best) $('#setModel').value = best;
-      }
-      status.textContent = `✓ Key works. Using "${$('#setModel').value}". ${models.length} models available: clear the Model box to see them all.`;
+      if (!models.includes(typed)) $('#setModel').value = 'auto';
+      const ranked = Gemini.rankModels(models);
+      status.textContent = `✓ Key works. "auto" will try ${ranked.slice(0, 3).join(', ')}${ranked.length > 3 ? '…' : ''} in that order.`;
     } catch (err) {
       status.textContent = `✗ ${Gemini.friendly(err)}`;
     }
